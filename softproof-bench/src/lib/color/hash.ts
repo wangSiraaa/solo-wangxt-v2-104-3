@@ -11,3 +11,8 @@ export function fnv1a64(bytes: Uint8Array): string {
   }
   return h.toString(16).padStart(16, '0');
 }
+
+/** Hash a string (UTF-8 encoded) — used for condition/spec fingerprints. */
+export function fnv1a64str(s: string): string {
+  return fnv1a64(new TextEncoder().encode(s));
+}

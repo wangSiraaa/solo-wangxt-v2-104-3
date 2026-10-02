@@ -1,16 +1,26 @@
 <script lang="ts">
   import { getApp } from './lib/db/state.svelte';
+  import { getCompare } from './lib/compare/compare.svelte';
   import ProfilePanel from './lib/components/ProfilePanel.svelte';
   import ProjectsPanel from './lib/components/ProjectsPanel.svelte';
   import CanvasView from './lib/components/CanvasView.svelte';
   import Sampler from './lib/components/Sampler.svelte';
   import ExportBar from './lib/components/ExportBar.svelte';
+  import ComparePanel from './lib/components/ComparePanel.svelte';
+  import CompareView from './lib/components/CompareView.svelte';
+  import CompareSampler from './lib/components/CompareSampler.svelte';
   import { PROFILE_ATTRIBUTION } from './lib/db/builtinProfiles';
   import type { SampleInfo } from './lib/color/engine';
 
   const app = getApp();
   const s = app.state;
+  const cmp = getCompare();
   app.init();
+  cmp.init();
+
+  // 工作模式：单条件转换 / 打样条件对比（对比作业独立于主面板状态）。
+  let mode = $state<'single' | 'compare'>('single');
+  let cmpHover = $state<{ x: number; y: number } | null>(null);
 
   // Original pixels rendered as-is (jsquash raw RGBA; the browser is not asked
   // to convert). The transform itself always goes through the worker.
@@ -107,6 +117,35 @@
   {#if !s.ready}
     <div class="loading">正在加载 LittleCMS WASM 与内置开放配置…</div>
   {:else}
+    <nav class="modetabs">
+      <button class:active={mode === 'single'} onclick={() => (mode = 'single')}>单条件转换</button>
+      <button class:active={mode === 'compare'} onclick={() => (mode = 'compare')}>打样条件对比</button>
+    </nav>
+    {#if mode === 'compare'}
+      <div class="columns">
+        <aside class="sidebar scroll">
+          <ComparePanel {app} {cmp} />
+        </aside>
+
+        <section class="content">
+          <CompareView {cmp} hover={cmpHover} onhover={(h) => (cmpHover = h)} />
+        </section>
+
+        <aside class="rightbar scroll">
+          <CompareSampler {cmp} hover={cmpHover} />
+          <div class="panel stack">
+            <h2>对比纪律</h2>
+            <ol class="small rules">
+              <li>建档即冻结原稿像素与已确认源配置；主面板后续改动不影响本作业。</li>
+              <li>两侧各自从原图直接计算，任何一侧的结果都不会作为另一侧的输入。</li>
+              <li>修改任一条件后，该侧旧结果标为“已过期”，另一侧已完成结果保留。</li>
+              <li>取消或重开工程后，旧版本的在途结果一律丢弃，不写入新对比。</li>
+              <li>导出记录含两侧配置指纹与比较时间，便于留档核对。</li>
+            </ol>
+          </div>
+        </aside>
+      </div>
+    {:else}
     <div class="columns">
       <aside class="sidebar scroll">
         <ProfilePanel {app} />
@@ -174,6 +213,7 @@
         </div>
       </aside>
     </div>
+    {/if}
   {/if}
 </main>
 
@@ -240,6 +280,21 @@
     padding: 40px;
     text-align: center;
     color: var(--muted);
+  }
+  .modetabs {
+    display: flex;
+    gap: 8px;
+    padding: 8px 16px 0;
+  }
+  .modetabs button {
+    border-radius: 8px 8px 0 0;
+    border-bottom: none;
+    color: var(--muted);
+  }
+  .modetabs button.active {
+    color: var(--text);
+    border-color: var(--accent);
+    background: var(--panel);
   }
   .columns {
     flex: 1;

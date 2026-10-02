@@ -5,14 +5,18 @@
  *  projects  - full working state incl. original image bytes, embedded ICC,
  *              chosen source/target profile ids, settings and preview caches.
  *  profiles  - operator's ICC library (plus first-run seeded open profiles).
+ *  comparisons - proofing-condition comparison jobs: frozen original pixels,
+ *              frozen confirmed source profile, two independent side specs,
+ *              per-side results, sample pins and comparison summaries.
  */
 import type { RenderingIntent } from '../color/lcms';
 import type { ColorSpaceKind } from '../icc/profileInfo';
 
 const DB_NAME = 'softproof-bench';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 export const STORE_PROJECTS = 'projects';
 export const STORE_PROFILES = 'profiles';
+export const STORE_COMPARISONS = 'comparisons';
 
 export interface StoredProfile {
   id: string;
@@ -59,6 +63,9 @@ function openDb(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains(STORE_PROFILES)) {
         db.createObjectStore(STORE_PROFILES, { keyPath: 'id' });
+      }
+      if (!db.objectStoreNames.contains(STORE_COMPARISONS)) {
+        db.createObjectStore(STORE_COMPARISONS, { keyPath: 'id' });
       }
     };
     req.onsuccess = () => resolve(req.result);

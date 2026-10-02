@@ -33,6 +33,7 @@ function ensureWorker(): Worker {
       pending.delete(id);
       if (error) p.reject(new Error(error));
       else if (ev.data.type === 'result') p.resolve(toConverted(ev.data.result));
+      else if (ev.data.type === 'sample-multi-result') p.resolve(ev.data.infos as SampleInfo[]);
       else p.resolve(ev.data.info as SampleInfo);
     };
     worker.onerror = (e) => {
@@ -113,6 +114,30 @@ export function runSample(opts: {
     params: opts.params,
     x: opts.x,
     y: opts.y,
+  };
+  return new Promise((resolve, reject) => {
+    pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
+    w.postMessage(payload, [payload.imageBytes, payload.sourceIcc, payload.targetIcc]);
+  });
+}
+
+export function runSampleMulti(opts: {
+  imageBytes: Uint8Array;
+  sourceIcc: Uint8Array;
+  targetIcc: Uint8Array;
+  params: EngineParams;
+  points: { x: number; y: number }[];
+}): Promise<SampleInfo[]> {
+  const w = ensureWorker();
+  const id = seq++;
+  const payload = {
+    type: 'sample-multi' as const,
+    id,
+    imageBytes: copy(ab(opts.imageBytes)),
+    sourceIcc: copy(ab(opts.sourceIcc)),
+    targetIcc: copy(ab(opts.targetIcc)),
+    params: opts.params,
+    points: opts.points,
   };
   return new Promise((resolve, reject) => {
     pending.set(id, { resolve: resolve as (v: unknown) => void, reject });

@@ -9,6 +9,9 @@
  *  -> { type: 'sample', id, imageBytes, sourceIcc, targetIcc, params, x, y }
  *  <-  { type: 'sample-result', id, info?, error? }
  *
+ *  -> { type: 'sample-multi', id, imageBytes, sourceIcc, targetIcc, params, points }
+ *  <-  { type: 'sample-multi-result', id, infos?, error? }
+ *
  * Profiles and images arrive as ArrayBuffers (zero-copy transfer when sent
  * from the caller with a transfer list; here we clone to keep originals).
  */
@@ -36,7 +39,16 @@ export interface SampleRequest {
   x: number;
   y: number;
 }
-export type WorkerRequest = ConvertRequest | SampleRequest;
+export interface SampleMultiRequest {
+  type: 'sample-multi';
+  id: number;
+  imageBytes: ArrayBuffer;
+  sourceIcc: ArrayBuffer;
+  targetIcc: ArrayBuffer;
+  params: EngineParams;
+  points: { x: number; y: number }[];
+}
+export type WorkerRequest = ConvertRequest | SampleRequest | SampleMultiRequest;
 
 self.onmessage = async (ev: MessageEvent<WorkerRequest>) => {
   const msg = ev.data;
@@ -58,13 +70,19 @@ self.onmessage = async (ev: MessageEvent<WorkerRequest>) => {
         },
         transferableOf(result),
       );
+    } else if (msg.type === 'sample-multi') {
+      const infos = [];
+      for (const pt of msg.points) {
+        infos.push(await samplePixel(decoded, profiles, msg.params, pt.x, pt.y));
+      }
+      self.postMessage({ type: 'sample-multi-result', id: msg.id, infos });
     } else {
       const info = await samplePixel(decoded, profiles, msg.params, msg.x, msg.y);
       self.postMessage({ type: 'sample-result', id: msg.id, info });
     }
   } catch (err) {
     self.postMessage({
-      type: msg.type === 'sample' ? 'sample-result' : 'result',
+      type: msg.type === 'sample' ? 'sample-result' : msg.type === 'sample-multi' ? 'sample-multi-result' : 'result',
       id: msg.id,
       error: err instanceof Error ? err.message : String(err),
     });
