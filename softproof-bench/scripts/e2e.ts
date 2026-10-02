@@ -16,7 +16,9 @@
  */
 import { chromium, type Browser, type Page } from 'playwright';
 import { readFileSync, existsSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { resolve } from 'node:path';
+import { fnv1a64 } from '../src/lib/color/hash';
 
 const ROOT = resolve(import.meta.dirname, '..');
 const FIX = resolve(ROOT, 'test-assets/browser');
@@ -83,10 +85,75 @@ async function exportPair(page: Page): Promise<{ png: string; tif?: string }> {
 }
 
 async function main() {
+  // The corrupted-profile fixture is normally produced by make-fixtures (via
+  // test:node); regenerate it here when missing so the e2e is self-contained.
+  const corruptedPath = resolve(PROFILES, 'corrupted-truncated.icc');
+  if (!existsSync(corruptedPath)) {
+    const { writeFileSync, mkdirSync } = await import('node:fs');
+    mkdirSync(PROFILES, { recursive: true });
+    const full = readFileSync(resolve(ROOT, 'public/profiles/sRGB-elle-V2-srgbtrc.icc'));
+    writeFileSync(corruptedPath, full.subarray(0, 6000));
+  }
+
+  // Sandboxes without a full OS may carry chromium's shared libraries in a
+  // user-local dir; expose them to the browser process when present.
+  const localLibs = [
+    resolve(homedir(), '.local/chromium-libs/usr/lib/aarch64-linux-gnu'),
+    resolve(homedir(), '.local/chromium-libs/lib/aarch64-linux-gnu'),
+  ].filter((d) => existsSync(d));
+  const env = localLibs.length
+    ? { ...process.env, LD_LIBRARY_PATH: [...localLibs, process.env.LD_LIBRARY_PATH].filter(Boolean).join(':') }
+    : undefined;
   const browser = await chromium.launch({
     headless: true,
     args: ['--use-fake-ui-for-media-stream', '--no-sandbox'],
+    ...(env ? { env } : {}),
   });
+
+  // ---------- compare helpers ----------
+  async function selectOptionContaining(page: Page, testid: string, fragment: string) {
+    const sel = page.getByTestId(testid);
+    const opts = await sel.locator('option').allInnerTexts();
+    const idx = opts.findIndex((o) => o.includes(fragment));
+    if (idx < 0) throw new Error(`option "${fragment}" not found in ${testid}: ${opts.join(' | ')}`);
+    await sel.selectOption({ index: idx });
+  }
+  async function waitSide(page: Page, side: 'A' | 'B', label: string, timeout = 30000) {
+    await page.waitForFunction(
+      ([s, expected]) =>
+        document.querySelector(`[data-testid="side-status-${s}"]`)?.textContent?.includes(expected as string),
+      [side, label] as const,
+      { timeout },
+    );
+  }
+  async function canvasPixel(page: Page, stage: string, x: number, y: number): Promise<number[]> {
+    return page.evaluate(
+      ([sel, px, py]) => {
+        const c = document.querySelector(`${sel} canvas`) as HTMLCanvasElement | null;
+        if (!c || !c.width) return [];
+        return Array.from(c.getContext('2d')!.getImageData(px as number, py as number, 1, 1).data);
+      },
+      [stage, x, y] as const,
+    );
+  }
+  async function downloadCompareRecord(page: Page): Promise<{ name: string; path: string }> {
+    const waiter = page.waitForEvent('download', { timeout: 15000 });
+    await page.getByTestId('export-record').click();
+    const d = await waiter;
+    const p = resolve(ROOT, 'test-out', d.suggestedFilename());
+    await d.saveAs(p);
+    return { name: d.suggestedFilename(), path: p };
+  }
+  async function setupCompareJob(page: Page, aFragment: string, bFragment: string) {
+    await page.getByTestId('tab-compare').click();
+    await page.getByTestId('new-compare-job').click();
+    await page.waitForSelector('[data-testid="job-status"]');
+    await selectOptionContaining(page, 'target-A', aFragment);
+    await selectOptionContaining(page, 'target-B', bFragment);
+    await page.getByTestId('run-all').click();
+    await waitSide(page, 'A', '已完成');
+    await waitSide(page, 'B', '已完成');
+  }
 
   // ---------- Scenario A: embedded sRGB -> CIE RGB ----------
   {
@@ -240,6 +307,216 @@ async function main() {
     });
     ok('16-bit source proof canvas alpha preserved', info16.corner[3] === 0, JSON.stringify(info16.corner));
     ok('16-bit dimensions kept', info16.w === 12 && info16.h === 8, JSON.stringify(info16));
+    await page.close();
+  }
+
+  // ---------- Scenario G: compare — same ICC image, two distinguishable sides ----------
+  {
+    const page = await freshPage(browser);
+    console.log('# G. 对比：同一带 ICC 图片在两个目标条件下可区分');
+    await page
+      .locator('input[type=file][accept*=".icc"]')
+      .setInputFiles(resolve(PROFILES, 'ISOcoated_v2_300_mth.icc'));
+    await page.waitForTimeout(1200);
+    await importImage(page, resolve(FIX, 'patches-srgb.png'));
+    await page.waitForSelector('.badge.embedded');
+    await page.getByTestId('tab-compare').click();
+    await page.getByTestId('new-compare-job').click();
+    await page.waitForSelector('[data-testid="job-status"]');
+    ok('job created as draft', (await page.getByTestId('job-status').innerText()) === '草稿');
+    await selectOptionContaining(page, 'target-A', 'CIERGB');
+    await selectOptionContaining(page, 'target-B', 'ISO Coated');
+    await page.getByTestId('run-all').click();
+    await waitSide(page, 'A', '已完成');
+    await waitSide(page, 'B', '已完成');
+    ok('job complete', (await page.getByTestId('job-status').innerText()) === '完成');
+
+    const pa = await canvasPixel(page, '.cmp-stage-A', 2, 2);
+    const pb = await canvasPixel(page, '.cmp-stage-B', 2, 2);
+    ok('both side previews rendered', pa.length === 4 && pb.length === 4 && pa[3] === 255 && pb[3] === 255, JSON.stringify({ pa, pb }));
+    ok('two sides are distinguishable', pa.slice(0, 3).some((v, i) => Math.abs(v - pb[i]) > 2), `A=${pa} B=${pb}`);
+
+    await page.waitForSelector('[data-testid="compare-summary"]', { timeout: 30000 });
+    const differ = Number(await page.getByTestId('summary-differ').innerText());
+    ok('summary reports differing pixels', differ > 0, String(differ));
+    const maxde = Number(await page.getByTestId('summary-maxde').innerText());
+    ok('summary reports max dE00 > 0', maxde > 0, String(maxde));
+
+    // locatable sampling evidence: pin on canvas A
+    await page.locator('.cmp-stage-A canvas').click({ position: { x: 24, y: 16 } });
+    await page.waitForSelector('[data-testid="pin-deltae"]', { timeout: 30000 });
+    const pinDE = Number(await page.getByTestId('pin-deltae').innerText());
+    ok('pin shows cross-side dE00', pinDE > 0, String(pinDE));
+    const pinText = await page.locator('[data-testid="compare-pin"]').first().innerText();
+    ok('pin shows both sides device + Lab', pinText.includes('A') && pinText.includes('B') && pinText.includes('Lab'), pinText.slice(0, 160));
+
+    const rec = await downloadCompareRecord(page);
+    const json = JSON.parse(readFileSync(rec.path, 'utf8'));
+    ok(
+      'record carries BOTH side fingerprints (distinct)',
+      !!json.sides?.A?.fingerprint && !!json.sides?.B?.fingerprint && json.sides.A.fingerprint !== json.sides.B.fingerprint,
+    );
+    ok('record carries comparison time', typeof json.comparisonTime === 'string' && json.comparisonTime.length > 10, json.comparisonTime);
+    ok('record format marker', json.recordFormat === 'softproof-bench-compare/1');
+    const errs = (page as unknown as { __errs: string[] }).__errs.filter(
+      (e) => !e.includes('Failed to load resource') && !e.includes('favicon'),
+    );
+    ok('no page errors', errs.length === 0, errs.join(' | ').slice(0, 400));
+    await page.close();
+  }
+
+  // ---------- Scenario H: compare blocked until source confirmed ----------
+  {
+    const page = await freshPage(browser);
+    console.log('# H. 对比：缺 ICC 未确认源配置时两侧均不可启动');
+    await importImage(page, resolve(FIX, 'patches-noicc.png'));
+    await page.waitForSelector('.warn');
+    await page.getByTestId('tab-compare').click();
+    ok('create disabled while source unconfirmed', await page.getByTestId('new-compare-job').isDisabled());
+    const blocked = await page.getByTestId('create-blocked').innerText();
+    ok('blocked reason mentions missing ICC', blocked.includes('缺少嵌入'), blocked);
+
+    await page.locator('select').filter({ hasText: '请选择源配置' }).first().selectOption({ index: 1 });
+    await page.waitForSelector('.ok');
+    ok('create enabled after source confirmed', !(await page.getByTestId('new-compare-job').isDisabled()));
+    await page.getByTestId('new-compare-job').click();
+    await page.waitForSelector('[data-testid="job-status"]');
+    const frozen = await page.getByTestId('job-frozen').innerText();
+    ok('assumed source frozen into job', frozen.includes('人工假设'), frozen);
+    await selectOptionContaining(page, 'target-A', 'CIERGB');
+    await selectOptionContaining(page, 'target-B', 'sRGB');
+    await page.getByTestId('run-all').click();
+    await waitSide(page, 'A', '已完成');
+    await waitSide(page, 'B', '已完成');
+    ok('assumed-source job completes both sides', (await page.getByTestId('job-status').innerText()) === '完成');
+    await page.close();
+  }
+
+  // ---------- Scenario I: replace B (incl. mid-run) — A kept, old B stale ----------
+  {
+    const page = await freshPage(browser);
+    console.log('# I. 对比：替换 B 条件后 A 结果保留、旧 B 过期');
+    await page
+      .locator('input[type=file][accept*=".icc"]')
+      .setInputFiles(resolve(PROFILES, 'ISOcoated_v2_300_mth.icc'));
+    await page.waitForTimeout(1200);
+    await importImage(page, resolve(FIX, 'patches-srgb.png'));
+    await page.waitForSelector('.badge.embedded');
+    await setupCompareJob(page, 'CIERGB', 'sRGB');
+    ok('baseline complete', (await page.getByTestId('job-status').innerText()) === '完成');
+    const aPixBefore = await canvasPixel(page, '.cmp-stage-A', 3, 3);
+
+    // replace B while idle
+    await selectOptionContaining(page, 'target-B', 'ISO Coated');
+    await page.waitForSelector('[data-testid="stale-B"]');
+    ok('A stays done after B replaced', (await page.getByTestId('side-status-A').innerText()) === '已完成');
+    ok('old B result marked stale', (await page.getByTestId('side-status-B').innerText()) === '已过期');
+    ok('job partial', (await page.getByTestId('job-status').innerText()) === '部分完成');
+    const aPixAfter = await canvasPixel(page, '.cmp-stage-A', 3, 3);
+    ok('A preview pixels untouched', JSON.stringify(aPixBefore) === JSON.stringify(aPixAfter));
+
+    // replace B *while a run is in flight*: stale B result must never be written
+    await page.getByTestId('intent-A').selectOption({ index: 2 }); // A stale too
+    await page.waitForSelector('[data-testid="stale-A"]');
+    await page.getByTestId('run-all').click();
+    await selectOptionContaining(page, 'target-B', 'CIERGB'); // mid-run edit bumps B's run token
+    await waitSide(page, 'A', '已完成');
+    const bStatus = await page.getByTestId('side-status-B').innerText();
+    ok('B not done with unreconciled config after mid-run replace', bStatus !== '已完成', bStatus);
+    ok('A done and kept after mid-run replace of B', (await page.getByTestId('side-status-A').innerText()) === '已完成');
+    await page.getByTestId('run-B').click();
+    await waitSide(page, 'B', '已完成');
+    ok('job complete after B re-run', (await page.getByTestId('job-status').innerText()) === '完成');
+    await page.close();
+  }
+
+  // ---------- Scenario J: broken side config fails independently ----------
+  {
+    const page = await freshPage(browser);
+    console.log('# J. 对比：一侧配置损坏，另一侧结果与失败证据仍可查看');
+    await page
+      .locator('input[type=file][accept*=".icc"]')
+      .setInputFiles(resolve(PROFILES, 'corrupted-truncated.icc'));
+    await page.waitForTimeout(800);
+    const notice = await page.locator('.banner').first().innerText();
+    ok('corrupted profile accepted at parser level', notice.includes('已加入配置库'), notice);
+    await importImage(page, resolve(FIX, 'patches-srgb.png'));
+    await page.waitForSelector('.badge.embedded');
+    await page.getByTestId('tab-compare').click();
+    await page.getByTestId('new-compare-job').click();
+    await page.waitForSelector('[data-testid="job-status"]');
+    await selectOptionContaining(page, 'target-A', 'CIERGB');
+    await selectOptionContaining(page, 'target-B', 'corrupted');
+    await page.getByTestId('run-all').click();
+    await waitSide(page, 'B', '失败');
+    await waitSide(page, 'A', '已完成');
+    ok('job partial with B failed', (await page.getByTestId('job-status').innerText()) === '部分完成');
+    const errB = await page.getByTestId('error-B').innerText();
+    ok('failure evidence visible', errB.includes('失败证据') && errB.length > 12, errB);
+    const aPix = await canvasPixel(page, '.cmp-stage-A', 3, 3);
+    ok('A result still viewable', aPix.length === 4 && aPix[3] === 255, JSON.stringify(aPix));
+
+    // retry the failed side alone -> fails again, evidence stays, A untouched
+    await page.getByTestId('run-B').click();
+    await waitSide(page, 'B', '失败');
+    ok('B retry fails again with evidence', (await page.getByTestId('error-B').innerText()).includes('失败证据'));
+    ok('A still done after B retry', (await page.getByTestId('side-status-A').innerText()) === '已完成');
+
+    // fix B -> recovers independently
+    await selectOptionContaining(page, 'target-B', 'sRGB');
+    await page.getByTestId('run-B').click();
+    await waitSide(page, 'B', '已完成');
+    ok('job complete after B fixed', (await page.getByTestId('job-status').innerText()) === '完成');
+    await page.close();
+  }
+
+  // ---------- Scenario K: save / reload keeps frozen job independent of panel ----------
+  {
+    const page = await freshPage(browser);
+    console.log('# K. 对比：保存、刷新、重载后仍指向原图与冻结条件');
+    await page
+      .locator('input[type=file][accept*=".icc"]')
+      .setInputFiles(resolve(PROFILES, 'ISOcoated_v2_300_mth.icc'));
+    await page.waitForTimeout(1200);
+    await importImage(page, resolve(FIX, 'patches-srgb.png'));
+    await page.waitForSelector('.badge.embedded');
+    await setupCompareJob(page, 'CIERGB', 'ISO Coated');
+    const fpA = (await page.getByTestId('fingerprint-A').innerText()).trim();
+    const fpB = (await page.getByTestId('fingerprint-B').innerText()).trim();
+    const pixBefore = await canvasPixel(page, '.cmp-stage-A', 3, 3);
+
+    await page.reload();
+    await page.waitForSelector('.sidebar', { timeout: 15000 });
+    await page.getByTestId('tab-compare').click();
+    await page.waitForSelector('[data-testid^="open-job-"]', { timeout: 15000 });
+    await page.locator('[data-testid^="open-job-"]').first().click();
+    await page.waitForSelector('[data-testid="job-status"]');
+    ok('reloaded job still complete', (await page.getByTestId('job-status').innerText()) === '完成');
+    ok('job still points at original image', (await page.getByTestId('job-frozen').innerText()).includes('patches-srgb.png'));
+    ok(
+      'frozen fingerprints survive reload',
+      (await page.getByTestId('fingerprint-A').innerText()).trim() === fpA &&
+        (await page.getByTestId('fingerprint-B').innerText()).trim() === fpB,
+    );
+    const pixAfter = await canvasPixel(page, '.cmp-stage-A', 3, 3);
+    ok('stored preview re-rendered identically', pixAfter.length === 4 && JSON.stringify(pixBefore) === JSON.stringify(pixAfter));
+
+    // panel actions must not touch the frozen job
+    await importImage(page, resolve(FIX, 'patches-noicc.png'));
+    await page.waitForSelector('.warn');
+    await page.locator('label.field', { hasText: '目标 ICC' }).locator('select').selectOption({ index: 3 });
+    await page.waitForTimeout(400);
+    ok('job unaffected by new panel image', (await page.getByTestId('job-frozen').innerText()).includes('patches-srgb.png'));
+    ok('frozen conditions unaffected by panel', (await page.getByTestId('fingerprint-A').innerText()).trim() === fpA);
+    const pixFinal = await canvasPixel(page, '.cmp-stage-A', 3, 3);
+    ok('preview unchanged by panel actions', JSON.stringify(pixFinal) === JSON.stringify(pixBefore));
+
+    const rec = await downloadCompareRecord(page);
+    const json = JSON.parse(readFileSync(rec.path, 'utf8'));
+    const srcBytes = readFileSync(resolve(FIX, 'patches-srgb.png'));
+    ok('record image hash matches original file', json.image?.hash === fnv1a64(new Uint8Array(srcBytes)), json.image?.hash);
+    ok('record fingerprints match UI', fpA.includes(json.sides.A.fingerprint) && fpB.includes(json.sides.B.fingerprint));
+    ok('record comparison time present after reload', typeof json.comparisonTime === 'string' && json.comparisonTime.length > 10);
     await page.close();
   }
 

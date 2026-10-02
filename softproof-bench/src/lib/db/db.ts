@@ -1,18 +1,22 @@
 /**
  * All persistence stays in the browser via IndexedDB - images and ICC profiles
- * are never uploaded. Two object stores:
+ * are never uploaded. Three object stores:
  *
  *  projects  - full working state incl. original image bytes, embedded ICC,
  *              chosen source/target profile ids, settings and preview caches.
  *  profiles  - operator's ICC library (plus first-run seeded open profiles).
+ *  compareJobs - proofing-condition comparison jobs: frozen original pixels,
+ *              frozen confirmed source profile, two independent side-condition
+ *              snapshots, per-side results, summary and sample pins.
  */
 import type { RenderingIntent } from '../color/lcms';
 import type { ColorSpaceKind } from '../icc/profileInfo';
 
 const DB_NAME = 'softproof-bench';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 export const STORE_PROJECTS = 'projects';
 export const STORE_PROFILES = 'profiles';
+export const STORE_COMPARE = 'compareJobs';
 
 export interface StoredProfile {
   id: string;
@@ -59,6 +63,9 @@ function openDb(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains(STORE_PROFILES)) {
         db.createObjectStore(STORE_PROFILES, { keyPath: 'id' });
+      }
+      if (!db.objectStoreNames.contains(STORE_COMPARE)) {
+        db.createObjectStore(STORE_COMPARE, { keyPath: 'id' });
       }
     };
     req.onsuccess = () => resolve(req.result);

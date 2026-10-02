@@ -88,3 +88,16 @@ writeFileSync(
 );
 
 console.log('fixtures written to', dir);
+
+// Corrupted ICC fixture: header + declared size survive the app's own parser
+// (readProfileInfo), but the tag data is truncated so LittleCMS cannot open
+// or build a transform from it. Used to prove a broken side fails
+// independently while the other side's result stays intact.
+{
+  const full = readFileSync(resolve(root, 'public/profiles/sRGB-elle-V2-srgbtrc.icc'));
+  const truncated = Buffer.from(full.subarray(0, 6000)); // declared 9552 > 6000
+  const profDir = resolve(root, 'test-assets/profiles');
+  mkdirSync(profDir, { recursive: true });
+  writeFileSync(resolve(profDir, 'corrupted-truncated.icc'), truncated);
+  console.log('corrupted fixture written to', profDir);
+}

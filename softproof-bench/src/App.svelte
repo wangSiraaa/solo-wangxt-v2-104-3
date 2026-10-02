@@ -1,16 +1,24 @@
 <script lang="ts">
   import { getApp } from './lib/db/state.svelte';
+  import { getCompare } from './lib/compare/compare.svelte';
   import ProfilePanel from './lib/components/ProfilePanel.svelte';
   import ProjectsPanel from './lib/components/ProjectsPanel.svelte';
   import CanvasView from './lib/components/CanvasView.svelte';
   import Sampler from './lib/components/Sampler.svelte';
   import ExportBar from './lib/components/ExportBar.svelte';
+  import ComparePanel from './lib/components/ComparePanel.svelte';
+  import CompareSampler from './lib/components/CompareSampler.svelte';
   import { PROFILE_ATTRIBUTION } from './lib/db/builtinProfiles';
   import type { SampleInfo } from './lib/color/engine';
 
   const app = getApp();
   const s = app.state;
   app.init();
+  const cmp = getCompare();
+  cmp.init();
+
+  // 工作模式：单条件转换 / 打样条件对比
+  let mode = $state<'convert' | 'compare'>('convert');
 
   // Original pixels rendered as-is (jsquash raw RGBA; the browser is not asked
   // to convert). The transform itself always goes through the worker.
@@ -115,63 +123,101 @@
       </aside>
 
       <section class="content">
-        <div class="canvases">
-          <CanvasView
-            title="原图（原始像素）"
-            subtitle={s.image
-              ? (s.image.embedded
-                  ? '解释自嵌入 ICC'
-                  : s.sourceAssumed
-                    ? `按假设：${s.sourceProfile?.description}`
-                    : '未确定源配置')
-              : '未导入'}
-            width={origDims.w}
-            height={origDims.h}
-            rgba={originalRGBA}
-            displayMode="original"
-            pins={s.pins}
-            hover={{ x: s.hover.x, y: s.hover.y }}
-            onmove={onMove}
-            onleave={onLeave}
-            onpin={(x, y) => app.pin(x, y)}
-            accent="#8fd3ff"
-          />
-          <CanvasView
-            title="转换预览（软打样）"
-            subtitle={s.targetProfile
-              ? `${s.targetProfile.description} · ${s.intent} · BPC ${s.blackPointCompensation ? '开' : '关'}`
-              : ''}
-            width={s.result?.width ?? 0}
-            height={s.result?.height ?? 0}
-            rgba={s.result?.softProofRGBA ?? null}
-            displayMode="softproof"
-            pins={s.pins}
-            hover={{ x: s.hover.x, y: s.hover.y }}
-            onmove={onMove}
-            onleave={onLeave}
-            onpin={(x, y) => app.pin(x, y)}
-            accent="#ffb454"
-          />
+        <div class="modebar" role="tablist">
+          <button
+            role="tab"
+            aria-selected={mode === 'convert'}
+            class:active={mode === 'convert'}
+            data-testid="tab-convert"
+            onclick={() => (mode = 'convert')}
+          >
+            单条件转换
+          </button>
+          <button
+            role="tab"
+            aria-selected={mode === 'compare'}
+            class:active={mode === 'compare'}
+            data-testid="tab-compare"
+            onclick={() => (mode = 'compare')}
+          >
+            打样条件对比
+          </button>
         </div>
-        <ExportBar {app} />
+        {#if mode === 'convert'}
+          <div class="canvases">
+            <CanvasView
+              title="原图（原始像素）"
+              subtitle={s.image
+                ? (s.image.embedded
+                    ? '解释自嵌入 ICC'
+                    : s.sourceAssumed
+                      ? `按假设：${s.sourceProfile?.description}`
+                      : '未确定源配置')
+                : '未导入'}
+              width={origDims.w}
+              height={origDims.h}
+              rgba={originalRGBA}
+              displayMode="original"
+              pins={s.pins}
+              hover={{ x: s.hover.x, y: s.hover.y }}
+              onmove={onMove}
+              onleave={onLeave}
+              onpin={(x, y) => app.pin(x, y)}
+              accent="#8fd3ff"
+            />
+            <CanvasView
+              title="转换预览（软打样）"
+              subtitle={s.targetProfile
+                ? `${s.targetProfile.description} · ${s.intent} · BPC ${s.blackPointCompensation ? '开' : '关'}`
+                : ''}
+              width={s.result?.width ?? 0}
+              height={s.result?.height ?? 0}
+              rgba={s.result?.softProofRGBA ?? null}
+              displayMode="softproof"
+              pins={s.pins}
+              hover={{ x: s.hover.x, y: s.hover.y }}
+              onmove={onMove}
+              onleave={onLeave}
+              onpin={(x, y) => app.pin(x, y)}
+              accent="#ffb454"
+            />
+          </div>
+          <ExportBar {app} />
+        {:else}
+          <ComparePanel {app} {cmp} />
+        {/if}
       </section>
 
       <aside class="rightbar scroll">
-        <Sampler
-          hover={s.hover}
-          pins={s.pins.map((p) => ({ x: p.x, y: p.y, info: p.info ?? null, pending: p.pending, error: p.error }))}
-          onremove={(i: number) => app.removePin(i)}
-        />
-        <div class="panel stack">
-          <h2>流程纪律</h2>
-          <ol class="small rules">
-            <li>先看原图有没有嵌入配置；没有则必须人工指定源配置，假设写入记录。</li>
-            <li>再选印厂目标配置、渲染意图与黑点补偿。</li>
-            <li>右侧为目标→显示器的软打样模拟；只用于预览，不回灌转换。</li>
-            <li>导出图像嵌入目标 ICC 并带“已转换”标记；设置记录单独成文件。</li>
-            <li>再次导入带标记文件会被拦截，防止二次转换。</li>
-          </ol>
-        </div>
+        {#if mode === 'convert'}
+          <Sampler
+            hover={s.hover}
+            pins={s.pins.map((p) => ({ x: p.x, y: p.y, info: p.info ?? null, pending: p.pending, error: p.error }))}
+            onremove={(i: number) => app.removePin(i)}
+          />
+          <div class="panel stack">
+            <h2>流程纪律</h2>
+            <ol class="small rules">
+              <li>先看原图有没有嵌入配置；没有则必须人工指定源配置，假设写入记录。</li>
+              <li>再选印厂目标配置、渲染意图与黑点补偿。</li>
+              <li>右侧为目标→显示器的软打样模拟；只用于预览，不回灌转换。</li>
+              <li>导出图像嵌入目标 ICC 并带“已转换”标记；设置记录单独成文件。</li>
+              <li>再次导入带标记文件会被拦截，防止二次转换。</li>
+            </ol>
+          </div>
+        {:else}
+          <CompareSampler {cmp} />
+          <div class="panel stack">
+            <h2>对比纪律</h2>
+            <ol class="small rules">
+              <li>对比作业冻结同一原稿与同一已确认源配置；未确认源配置时两侧均不可启动。</li>
+              <li>A/B 两套条件各自独立快照（目标配置、意图、BPC、软打样意图），互不影响。</li>
+              <li>两侧均从原始像素直接计算，任何一侧结果都不会作为另一侧输入。</li>
+              <li>修改条件、取消或重开作业后，迟到的旧结果一律按作业版本丢弃。</li>
+              <li>导出记录包含两侧条件指纹与比较时间，可向客户存档。</li>
+            </ol>
+          </div>
+        {/if}
       </aside>
     </div>
   {/if}
@@ -262,6 +308,18 @@
     flex-direction: column;
     gap: 12px;
     min-height: 0;
+  }
+  .modebar {
+    display: flex;
+    gap: 8px;
+  }
+  .modebar button {
+    flex: 0 0 auto;
+    opacity: 0.65;
+  }
+  .modebar button.active {
+    opacity: 1;
+    border-color: var(--accent);
   }
   .canvases {
     flex: 1;

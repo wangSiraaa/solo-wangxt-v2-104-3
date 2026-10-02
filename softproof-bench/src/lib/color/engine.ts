@@ -198,21 +198,24 @@ export interface SampleInfo {
   targetColorSpace: ColorSpaceKind;
 }
 
-/** Float64 sampling at one pixel, values normalized from file bit depth. */
-export async function samplePixel(
-  decoded: DecodedImage,
-  profiles: ProfileSet,
+type Opened = ReturnType<typeof openProfile>;
+
+/** Core of the float64 sampler with already-open profiles (coordinates clamped). */
+function sampleCore(
+  lcms: Mod,
+  norm: Packed,
+  width: number,
+  height: number,
+  src: Opened,
+  dst: Opened,
+  labHandle: number,
   params: EngineParams,
   x: number,
   y: number,
-): Promise<SampleInfo> {
-  const lcms = await getMod();
-  const src = openProfile(lcms, profiles.source.bytes, 'source');
-  const dst = openProfile(lcms, profiles.target.bytes, 'target');
-  const lab = { handle: lcms.cmsCreateLab4Profile() };
-
-  const norm = normalize(decoded);
-  const idx = y * decoded.width + x;
+): SampleInfo {
+  const cx = Math.min(width - 1, Math.max(0, x));
+  const cy = Math.min(height - 1, Math.max(0, y));
+  const idx = cy * width + cx;
   const max = norm.bitDepth === 16 ? 65535 : 255;
   const vals: number[] = [];
   for (let c = 0; c < norm.colorChannels; c++) vals.push(norm.view[idx * (norm.colorChannels + (norm.hasAlpha ? 1 : 0)) + c] / max);
@@ -225,7 +228,7 @@ export async function samplePixel(
   const sourceLab = transformDouble({
     mod: lcms,
     srcHandle: src.handle,
-    dstHandle: lab.handle,
+    dstHandle: labHandle,
     srcChannels: src.channels,
     dstChannels: 3,
     values: vals,
@@ -248,16 +251,12 @@ export async function samplePixel(
   const targetLab = transformDouble({
     mod: lcms,
     srcHandle: dst.handle,
-    dstHandle: lab.handle,
+    dstHandle: labHandle,
     srcChannels: dst.channels,
     dstChannels: 3,
     values: targetNorm,
     params: { intent: 'relative-colorimetric', blackPointCompensation: false },
   }) as [number, number, number];
-
-  lcms.cmsCloseProfile(src.handle);
-  lcms.cmsCloseProfile(dst.handle);
-  lcms.cmsCloseProfile(lab.handle);
 
   return {
     sourceDevice: vals,
@@ -268,4 +267,53 @@ export async function samplePixel(
     sourceColorSpace: src.colorSpace,
     targetColorSpace: dst.colorSpace,
   };
+}
+
+/** Float64 sampling at one pixel, values normalized from file bit depth. */
+export async function samplePixel(
+  decoded: DecodedImage,
+  profiles: ProfileSet,
+  params: EngineParams,
+  x: number,
+  y: number,
+): Promise<SampleInfo> {
+  const lcms = await getMod();
+  const src = openProfile(lcms, profiles.source.bytes, 'source');
+  const dst = openProfile(lcms, profiles.target.bytes, 'target');
+  const lab = { handle: lcms.cmsCreateLab4Profile() };
+  try {
+    return sampleCore(lcms, normalize(decoded), decoded.width, decoded.height, src, dst, lab.handle, params, x, y);
+  } finally {
+    lcms.cmsCloseProfile(src.handle);
+    lcms.cmsCloseProfile(dst.handle);
+    lcms.cmsCloseProfile(lab.handle);
+  }
+}
+
+/**
+ * Batched float64 sampling: profiles are opened once and every point is
+ * sampled against the same decoded ORIGINAL pixels. Used by the comparison
+ * workflow so both sides are measured from the same source, never from each
+ * other's converted output.
+ */
+export async function samplePoints(
+  decoded: DecodedImage,
+  profiles: ProfileSet,
+  params: EngineParams,
+  points: { x: number; y: number }[],
+): Promise<SampleInfo[]> {
+  const lcms = await getMod();
+  const src = openProfile(lcms, profiles.source.bytes, 'source');
+  const dst = openProfile(lcms, profiles.target.bytes, 'target');
+  const lab = { handle: lcms.cmsCreateLab4Profile() };
+  try {
+    const norm = normalize(decoded);
+    return points.map((p) =>
+      sampleCore(lcms, norm, decoded.width, decoded.height, src, dst, lab.handle, params, p.x, p.y),
+    );
+  } finally {
+    lcms.cmsCloseProfile(src.handle);
+    lcms.cmsCloseProfile(dst.handle);
+    lcms.cmsCloseProfile(lab.handle);
+  }
 }
